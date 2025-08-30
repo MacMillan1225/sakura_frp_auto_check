@@ -15,7 +15,7 @@ def get_gap_offset(bg_path, fullbg_path, debug=False):
         cv2.imwrite("debug_03_diff.png", diff)
 
     # 3. 二值化
-    _, thresh = cv2.threshold(diff, 50, 255, cv2.THRESH_BINARY)
+    _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
     if debug:
         cv2.imwrite("debug_04_thresh.png", thresh)
 
