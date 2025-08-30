@@ -1,190 +1,229 @@
 from playwright.sync_api import sync_playwright
-import os
-import cv2
-import numpy as np
-import time
+from pathlib import Path
 import random
 import mycv
+import time
 
-from pathlib import Path
-
-# 目标地址
+# ========= 配置 =========
 domain = "www.natfrp.com"
 target_url = f"https://{domain}/user/"
-
-# cookie 文件路径
-COOKIE_FILE = Path("cookies.txt")
-
-# 状态文件
+COOKIE_FILE = Path("cookies.txt")  # 第一行用户名，第二行密码，其余 Cookie
 STATE_FILE = "state.json"
+MAX_RETRY = 5  # 0 表示无限重试，>0 表示最大重试次数
+# ========================
 
-def load_cookies_from_file(path: Path) -> str:
-    """从文件读取 Cookie 字符串"""
+
+def load_user_pass_and_cookies(path: Path):
     if not path.exists():
-        raise FileNotFoundError(f"Cookie 文件不存在: {path}")
-    return path.read_text(encoding="utf-8").strip()
+        raise FileNotFoundError(f"{path} 文件不存在")
+    lines = [l.strip() for l in path.read_text(encoding="utf-8").strip().splitlines() if l.strip()]
+    if len(lines) < 3:
+        raise ValueError("cookies.txt 必须至少有三行：用户名、密码、cookie字符串")
+    username, password = lines[0], lines[1]
+    cookies_str = "\n".join(lines[2:])
+    return username, password, cookies_str
 
-def inject_initial_cookies(context):
-    """将文本文件中的 cookies 注入 Context"""
-    cookies_str = load_cookies_from_file(COOKIE_FILE)
+
+def inject_cookies(context, cookies_str):
     cookies_list = []
-    # 按分号拆分为 name=value
-    for pair in cookies_str.split(";"):
-        pair = pair.strip()
-        if not pair:
-            continue
-        if "=" not in pair:
-            print(f"[WARN] 无效的 cookie 格式: {pair}")
-            continue
-        name, value = pair.split("=", 1)
-        cookies_list.append({
-            "name": name.strip(),
-            "value": value.strip(),
-            "domain": domain,
-            "path": "/",
-            "secure": True,
-            "httpOnly": False
-        })
+    for pair in cookies_str.strip().replace("\n", "").split(";"):
+        if pair.strip() and "=" in pair:
+            name, value = pair.strip().split("=", 1)
+            cookies_list.append({
+                "name": name.strip(),
+                "value": value.strip(),
+                "domain": domain,
+                "path": "/",
+                "secure": True,
+                "httpOnly": False
+            })
     context.add_cookies(cookies_list)
-    print("[INFO] 已注入初始 Cookie")
+    print("[INFO] 已注入 Cookies")
 
-def confirm_age_if_needed(page):
-    """等待并点击 '是，我已满18岁' 按钮"""
+
+# ---------------- 检测函数 ----------------
+def is_cookie_expired(page, timeout=3000):
     try:
-        print("[INFO] 尝试点击")
-        page.wait_for_selector('text=是，我已满18岁', timeout=5000)
+        page.wait_for_selector("text=Nyatwork 登录", timeout=timeout)
+        return True
+    except:
+        return False
+
+
+def confirm_age_if_needed(page, timeout=3000):
+    try:
+        page.wait_for_selector('text=是，我已满18岁', timeout=timeout)
         page.click('text=是，我已满18岁')
         print("[INFO] 已点击满18岁确认按钮")
     except:
-        print("[INFO] 没有检测到满18岁确认按钮，跳过")
+        print("[INFO] 无需进行年龄确认")
 
-def sign_in_if_needed(page):
-    """等待并点击 '点击这里签到' 按钮"""
+
+def is_logged_in(page, timeout=3000):
     try:
-        page.wait_for_selector('text=点击这里签到', timeout=5000)
-        page.click('text=点击这里签到')
-        print("[INFO] 已点击签到按钮")
+        page.wait_for_selector("text=账号信息", timeout=timeout)
+        print("[INFO] 检测到已登录状态")
+        return True
     except:
-        print("[INFO] 没有检测到签到按钮，跳过")
+        return False
 
-def human_track(distance):
-    """只有加速、匀速、减速三步轨迹"""
-    track = []
-    current = 0
 
-    # 比例分配
-    accel_dist = distance * 0.3
-    const_dist = distance * 0
-    decel_dist = distance - accel_dist - const_dist
+def is_sign_button_visible(page, timeout=3000):
+    try:
+        page.wait_for_selector("text=点击这里签到", timeout=timeout)
+        return True
+    except:
+        return False
 
-    # 加速段（第1步）
-    move = accel_dist + random.uniform(-2, 2)  # 加点随机
-    current += move
-    track.append(round(move))
 
-    # 匀速段（第2步）
-    move = const_dist + random.uniform(-2, 2)
-    current += move
-    track.append(round(move))
+def is_captcha_visible(page, timeout=3000):
+    try:
+        page.wait_for_selector(".geetest_slider_button", timeout=timeout)
+        return True
+    except:
+        return False
 
-    # 减速段（第3步）
-    move = decel_dist + random.uniform(-1, 1)
-    # 修正最后一步到终点
-    if current + move != distance:
-        move = distance - current
-    current += move
-    track.append(round(move))
 
-    return track
+def wait_captcha_disappear(page, timeout=10000):
+    try:
+        page.wait_for_selector("text=签到成功", timeout=timeout)
+        return True
+    except:
+        return False
+
+
+# ---------------- 操作函数 ----------------
+def login_with_user_pass(page, username, password):
+    page.fill("#username", username)
+    page.fill("#password", password)
+    page.click("button[id=login]")
+    print("[INFO] 已提交登录表单")
+
+
+def click_sign_in_button(page):
+    page.click("text=点击这里签到")
+    print("[INFO] 已点击签到按钮")
+
+
+def drag_slider_fixed_steps(page, slider_element, distance, button_type="middle", debug_pause=False):
+    box = slider_element.bounding_box()
+    start_x = int(box['x'])
+    start_y = int(box['y'] + box['height'] / 2)
+
+    print(f"[INFO] 滑块初始坐标: ({start_x}, {start_y})")
+    print(f"[INFO] 目标滑动距离: {distance} 像素")
+
+    page.mouse.move(start_x, start_y)
+    page.mouse.down(button=button_type)
+    page.wait_for_timeout(300)
+
+    page.mouse.move(start_x + distance + random.randint(2, 8), start_y)
+    page.wait_for_timeout(500)
+
+    page.mouse.move(start_x + distance - 2, start_y)
+    page.mouse.move(start_x + distance - 6, start_y)
+    page.wait_for_timeout(400)
+    page.mouse.move(start_x + distance - 8, start_y)
+
+    page.mouse.up(button=button_type)
+    print("[INFO] 滑动完成")
+
+    if debug_pause:
+        page.pause()
 
 
 def solve_geetest_puzzle(page):
-    # 等待拼图组件加载出来
-    page.wait_for_selector('.geetest_slider_button', timeout=10000)
-
-    # 截图有缺口背景
     bg_path = "bg.png"
     fullbg_path = "fullbg.png"
     page.query_selector('.geetest_canvas_bg').screenshot(path=bg_path)
-
-    # 显示完整背景（fullbg）
-    page.evaluate("""
-        document.querySelector('.geetest_canvas_fullbg').style.display = 'block';
-    """)
+    page.evaluate("""document.querySelector('.geetest_canvas_fullbg').style.display = 'block';""")
     page.query_selector('.geetest_canvas_fullbg').screenshot(path=fullbg_path)
-    # 再隐藏回去
-    page.evaluate("""
-        document.querySelector('.geetest_canvas_fullbg').style.display = 'none';
-    """)
+    page.evaluate("""document.querySelector('.geetest_canvas_fullbg').style.display = 'none';""")
 
-    # 用 OpenCV 算缺口位置
     gap_x = mycv.get_gap_offset(bg_path, fullbg_path, debug=True)
-    print(f"[INFO] 检测到缺口 x 坐标: {gap_x}")
+    print(f"[INFO] 缺口坐标: {gap_x}")
 
-    # 获取滑块位置
     slider = page.query_selector('.geetest_slider_button')
-    box = slider.bounding_box()
+    distance = gap_x
 
-    # 计算最终滑动距离（可加比例修正，这里先简单用缺口值）
-    distance = gap_x - 6
-    print(f"[INFO] 需要滑动距离: {distance}")
+    drag_slider_fixed_steps(page, slider, distance, button_type="left", debug_pause=False)
+    print("[INFO] 验证码滑动完成")
 
-    track = human_track(distance)
-    print("[INFO] 生成滑动轨迹:", track)
 
-    # 计算起始位置
-    start_x = box['x'] + box['width'] / 2
-    start_y = box['y'] + box['height'] / 2
+# ---------------- 主逻辑 ----------------
+def main() -> bool:
+    """
+    主流程
+    :return: True 表示成功，False 表示失败需要重试
+    """
+    username, password, cookies_str = load_user_pass_and_cookies(COOKIE_FILE)
 
-    # 模拟人类轨迹
-    current_x = start_x
-    current_y = start_y
-
-    page.mouse.move(start_x, start_y)
-    page.mouse.down()
-
-    for move in track:
-        current_x += move
-        page.mouse.move(current_x, current_y, steps=50)
-    page.mouse.up()
-
-    print("[INFO] 拼图滑动完成")
-
-def main():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False, slow_mo=200)
 
         try:
             context = browser.new_context(storage_state=STATE_FILE)
-            print("[INFO] 使用保存的登录状态")
-        except Exception as e:
-            print(f"[WARN] 读取登录状态失败: {e}")
+            print("[INFO] 加载保存的状态")
+        except:
             context = browser.new_context()
-            try:
-                inject_initial_cookies(context)
-            except Exception as e2:
-                print(f"[WARN] 注入 Cookie 文件失败: {e2}")
-                # 在这里可以提示用户输入 Cookie 字符串
+            inject_cookies(context, cookies_str)
 
-        print("[INFO] aaaaaa")
         page = context.new_page()
-        page.goto(target_url, wait_until="domcontentloaded")
+        page.goto(target_url, timeout=8000)
 
-        # 满 18 岁确认
         confirm_age_if_needed(page)
 
-        # 签到
-        sign_in_if_needed(page)
+        if is_cookie_expired(page):
+            print("[WARN] Cookie 已过期，使用用户名密码登录")
+            login_with_user_pass(page, username, password)
+            if is_logged_in(page):
+                print("[INFO] 登录成功，更新状态文件")
+                context.storage_state(path=STATE_FILE)
+            else:
+                print("[ERROR] 登录失败")
+                browser.close()
+                return False
 
-        # 处理验证码
-        solve_geetest_puzzle(page)
+        if is_sign_button_visible(page):
+            click_sign_in_button(page)
+            if is_captcha_visible(page):
+                solve_geetest_puzzle(page)
+                if wait_captcha_disappear(page):
+                    print("[INFO] 签到成功（验证码消失）")
+                    browser.close()
+                    return True
+                else:
+                    print("[ERROR] 签到失败，验证码未消失")
+                    browser.close()
+                    return False
+            else:
+                print("[INFO] 无需验证码，签到成功")
+                browser.close()
+                return True
+        else:
+            print("[INFO] 未发现签到按钮，可能已签到")
+            browser.close()
+            return True
 
-        # 保存登录状态
-        context.storage_state(path=STATE_FILE)
-        print(f"[INFO] 登录状态已保存到 {STATE_FILE}")
 
-        page.wait_for_timeout(5000)
-        browser.close()
-
+# ---------------- 带重试启动 ----------------
 if __name__ == "__main__":
-    main()
+    attempt = 0
+    while True:
+        attempt += 1
+        print(f"\n[INFO] 第 {attempt} 次执行签到")
+        try:
+            success = main()
+        except Exception as e:
+            print(f"[ERROR] 程序异常: {e}")
+            success = False
+
+        if success:
+            print("[INFO] 本次执行成功，退出程序")
+            break
+        else:
+            if MAX_RETRY > 0 and attempt >= MAX_RETRY:
+                print("[ERROR] 超过最大重试次数，退出程序")
+                break
+            print("[WARN] 本次失败，10秒后重试")
+            time.sleep(10)
