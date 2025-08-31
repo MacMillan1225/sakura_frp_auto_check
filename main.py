@@ -7,48 +7,28 @@ import time
 # ========= 配置 =========
 domain = "www.natfrp.com"
 target_url = f"https://{domain}/user/"
-COOKIE_FILE = Path("cookies.txt")  # 第一行用户名，第二行密码，其余 Cookie
+ACCOUNT_FILE = Path("account.txt")  # 第一行用户名，第二行密码
 STATE_FILE = "state.json"
 MAX_RETRY = 5  # 0 表示无限重试，>0 表示最大重试次数
 # ========================
 
-
-def load_user_pass_and_cookies(path: Path):
+# ---------------- 读取账号密码 ----------------
+def load_username_password(path: Path):
     if not path.exists():
         raise FileNotFoundError(f"{path} 文件不存在")
     lines = [l.strip() for l in path.read_text(encoding="utf-8").strip().splitlines() if l.strip()]
-    if len(lines) < 3:
-        raise ValueError("cookies.txt 必须至少有三行：用户名、密码、cookie字符串")
-    username, password = lines[0], lines[1]
-    cookies_str = "\n".join(lines[2:])
-    return username, password, cookies_str
-
-
-def inject_cookies(context, cookies_str):
-    cookies_list = []
-    for pair in cookies_str.strip().replace("\n", "").split(";"):
-        if pair.strip() and "=" in pair:
-            name, value = pair.strip().split("=", 1)
-            cookies_list.append({
-                "name": name.strip(),
-                "value": value.strip(),
-                "domain": domain,
-                "path": "/",
-                "secure": True,
-                "httpOnly": False
-            })
-    context.add_cookies(cookies_list)
-    print("[INFO] 已注入 Cookies")
-
+    if len(lines) < 2:
+        raise ValueError("account.txt 必须至少有两行：用户名、密码")
+    return lines[0], lines[1]
 
 # ---------------- 检测函数 ----------------
 def is_cookie_expired(page, timeout=3000):
     try:
+        # 页面出现“Nyatwork 登录”说明需要重新登录
         page.wait_for_selector("text=Nyatwork 登录", timeout=timeout)
         return True
     except:
         return False
-
 
 def confirm_age_if_needed(page, timeout=3000):
     try:
@@ -58,7 +38,6 @@ def confirm_age_if_needed(page, timeout=3000):
     except:
         print("[INFO] 无需进行年龄确认")
 
-
 def is_logged_in(page, timeout=3000):
     try:
         page.wait_for_selector("text=账号信息", timeout=timeout)
@@ -67,14 +46,12 @@ def is_logged_in(page, timeout=3000):
     except:
         return False
 
-
 def is_sign_button_visible(page, timeout=3000):
     try:
         page.wait_for_selector("text=点击这里签到", timeout=timeout)
         return True
     except:
         return False
-
 
 def is_captcha_visible(page, timeout=3000):
     try:
@@ -83,14 +60,12 @@ def is_captcha_visible(page, timeout=3000):
     except:
         return False
 
-
 def wait_captcha_disappear(page, timeout=10000):
     try:
         page.wait_for_selector("text=签到成功", timeout=timeout)
         return True
     except:
         return False
-
 
 # ---------------- 操作函数 ----------------
 def login_with_user_pass(page, username, password):
@@ -99,11 +74,9 @@ def login_with_user_pass(page, username, password):
     page.click("button[id=login]")
     print("[INFO] 已提交登录表单")
 
-
 def click_sign_in_button(page):
     page.click("text=点击这里签到")
     print("[INFO] 已点击签到按钮")
-
 
 def drag_slider_fixed_steps(page, slider_element, distance, button_type="middle", debug_pause=False):
     box = slider_element.bounding_box()
@@ -131,7 +104,6 @@ def drag_slider_fixed_steps(page, slider_element, distance, button_type="middle"
     if debug_pause:
         page.pause()
 
-
 def solve_geetest_puzzle(page):
     bg_path = "bg.png"
     fullbg_path = "fullbg.png"
@@ -149,32 +121,33 @@ def solve_geetest_puzzle(page):
     drag_slider_fixed_steps(page, slider, distance, button_type="left", debug_pause=False)
     print("[INFO] 验证码滑动完成")
 
-
 # ---------------- 主逻辑 ----------------
 def main() -> bool:
     """
     主流程
     :return: True 表示成功，False 表示失败需要重试
     """
-    username, password, cookies_str = load_user_pass_and_cookies(COOKIE_FILE)
+    username, password = load_username_password(ACCOUNT_FILE)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False, slow_mo=200)
+        browser = p.chromium.launch(headless=True, slow_mo=200)
 
+        # 先尝试从 state.json 加载状态（cookie/session）
         try:
             context = browser.new_context(storage_state=STATE_FILE)
-            print("[INFO] 加载保存的状态")
+            print("[INFO] 已加载保存的状态文件")
         except:
+            print("[WARN] 未找到状态文件，将新建上下文")
             context = browser.new_context()
-            inject_cookies(context, cookies_str)
 
         page = context.new_page()
         page.goto(target_url, timeout=8000)
 
         confirm_age_if_needed(page)
 
+        # 检查状态文件里的 cookie 是否失效
         if is_cookie_expired(page):
-            print("[WARN] Cookie 已过期，使用用户名密码登录")
+            print("[WARN] Cookie 已过期，使用账号密码登录")
             login_with_user_pass(page, username, password)
             if is_logged_in(page):
                 print("[INFO] 登录成功，更新状态文件")
@@ -205,13 +178,12 @@ def main() -> bool:
             browser.close()
             return True
 
-
 # ---------------- 带重试启动 ----------------
 if __name__ == "__main__":
     attempt = 0
     while True:
         attempt += 1
-        print(f"\n[INFO] 第 {attempt} 次执行签到")
+        print(f"[INFO] 第 {attempt} 次执行签到")
         try:
             success = main()
         except Exception as e:
