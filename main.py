@@ -22,7 +22,7 @@ def load_username_password(path: Path):
     return lines[0], lines[1]
 
 # ---------------- 检测函数 ----------------
-def is_cookie_expired(page, timeout=3000):
+def is_cookie_expired(page, timeout=6000):
     try:
         # 页面出现“Nyatwork 登录”说明需要重新登录
         page.wait_for_selector("text=Nyatwork 登录", timeout=timeout)
@@ -30,7 +30,7 @@ def is_cookie_expired(page, timeout=3000):
     except:
         return False
 
-def confirm_age_if_needed(page, timeout=3000):
+def confirm_age_if_needed(page, timeout=6000):
     try:
         page.wait_for_selector('text=是，我已满18岁', timeout=timeout)
         page.click('text=是，我已满18岁')
@@ -38,7 +38,7 @@ def confirm_age_if_needed(page, timeout=3000):
     except:
         print("[INFO] 无需进行年龄确认")
 
-def is_logged_in(page, timeout=3000):
+def is_logged_in(page, timeout=6000):
     try:
         page.wait_for_selector("text=账号信息", timeout=timeout)
         print("[INFO] 检测到已登录状态")
@@ -46,14 +46,14 @@ def is_logged_in(page, timeout=3000):
     except:
         return False
 
-def is_sign_button_visible(page, timeout=3000):
+def is_sign_button_visible(page, timeout=6000):
     try:
         page.wait_for_selector("text=点击这里签到", timeout=timeout)
         return True
     except:
         return False
 
-def is_captcha_visible(page, timeout=3000):
+def is_captcha_visible(page, timeout=6000):
     try:
         page.wait_for_selector(".geetest_slider_button", timeout=timeout)
         return True
@@ -130,7 +130,7 @@ def main() -> bool:
     username, password = load_username_password(ACCOUNT_FILE)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, slow_mo=200)
+        browser = p.chromium.launch(headless=False, slow_mo=200)
 
         # 先尝试从 state.json 加载状态（cookie/session）
         try:
