@@ -176,7 +176,7 @@ def main() -> bool:
     username, password = load_username_password(ACCOUNT_FILE)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False, slow_mo=200)
+        browser = p.chromium.launch(headless=True, slow_mo=200)
 
         # 先尝试从 state.json 加载状态（cookie/session）
         try:
