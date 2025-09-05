@@ -56,6 +56,11 @@ target_url = f"https://{domain}/user/"
 ACCOUNT_FILE = Path("account.txt")  # 第一行用户名，第二行密码
 STATE_FILE = "state.json"
 MAX_RETRY = 5  # 0 表示无限重试，>0 表示最大重试次数
+
+# --- 新增/修改 ---
+ALREADY_SIGNED_TEXT = "今天已经签到过啦"       # 用于判定成功的文案（包含即可）
+SIGNED_ANCESTOR_LEVELS = 3                 # 向上取第 3 层父级
+SIGNED_ANCESTOR_SCREENSHOT = "checkin.png"  # 成功时保存截图的文件名
 # ========================
 
 # ---------------- 读取账号密码 ----------------
@@ -113,6 +118,68 @@ def wait_captcha_disappear(page, timeout=10000):
     except:
         return False
 
+# --- 新增/修改：查找“今天已经签到过啦”的元素（包含匹配），并取其第 N 层父级 ---
+def find_signed_text_locator(page, timeout=6000):
+    """
+    返回包含“今天已经签到过啦”的元素 locator（取第一个可见）。
+    使用 normalize-space 规避前后空格影响，并做“包含”匹配。
+    """
+    selector = "text=%s" % ALREADY_SIGNED_TEXT
+    try:
+        page.wait_for_selector(selector, timeout=timeout)
+        return page.locator(selector).first
+    except Exception as e:
+        return None
+
+def screenshot_signed_text_ancestor(page, levels: int = SIGNED_ANCESTOR_LEVELS,
+                                    path: str = SIGNED_ANCESTOR_SCREENSHOT,
+                                    timeout: int = 6000) -> bool:
+    """
+    截图“包含『今天已经签到过啦』的元素”的第 levels 层父级。
+    若未找到该元素或父级，兜底整页截图。返回 True 表示截到了祖先元素，False 表示做了兜底。
+    """
+    base = find_signed_text_locator(page, timeout=timeout)
+    if base is None:
+        # 没找到文本元素，整页兜底
+        try:
+            page.screenshot(path=path, full_page=True)
+            print(f"[WARN] 未找到包含『{ALREADY_SIGNED_TEXT}』的元素，已兜底整页截图：{path}")
+        except Exception as e:
+            print(f"[ERROR] 兜底整页截图失败：{e}")
+            return False
+        return False
+
+    try:
+        # 取第 N 层父级
+        ancestor = base.locator(f"xpath=ancestor::*[{levels}]").first
+        # 有些页面结构不够深，尝试逐级回退
+        for lvl in range(levels, 0, -1):
+            candidate = base.locator(f"xpath=ancestor::*[{lvl}]").first
+            try:
+                candidate.wait_for(state="visible", timeout=1200)
+                try:
+                    candidate.scroll_into_view_if_needed()
+                except:
+                    pass
+                candidate.screenshot(path=path)
+                print(f"[INFO] 已保存签到截图：{path}")
+                return True
+            except:
+                continue
+
+        # 如果所有层级都没成功，整页兜底
+        page.screenshot(path=path, full_page=True)
+        print(f"[WARN] 祖先节点截图未成功，已兜底整页截图：{path}")
+        return False
+    except Exception as e:
+        print(f"[ERROR] 祖先截图异常：{e}")
+        try:
+            page.screenshot(path=path, full_page=True)
+            print(f"[WARN] 异常时已兜底整页截图：{path}")
+        except:
+            return False
+        return False
+
 # ---------------- 操作函数 ----------------
 def login_with_user_pass(page, username, password):
     page.fill("#username", username)
@@ -167,6 +234,19 @@ def solve_geetest_puzzle(page):
     drag_slider_fixed_steps(page, slider, distance, button_type="left", debug_pause=False)
     print("[INFO] 验证码滑动完成")
 
+# --- 新增/修改：以“今天已经签到过啦”判定成功 ---
+def wait_signed_text_and_shoot(page, timeout=8000) -> bool:
+    """
+    等待出现包含『今天已经签到过啦』的元素；出现则截图其第 3 层父级并返回 True。
+    若未出现则返回 False。
+    """
+    loc = find_signed_text_locator(page, timeout=timeout)
+    if loc is None:
+        return False
+    # 找到了就截图祖先
+    screenshot_signed_text_ancestor(page, SIGNED_ANCESTOR_LEVELS, SIGNED_ANCESTOR_SCREENSHOT)
+    return True
+
 # ---------------- 主逻辑 ----------------
 def main() -> bool:
     """
@@ -176,7 +256,7 @@ def main() -> bool:
     username, password = load_username_password(ACCOUNT_FILE)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, slow_mo=200)
+        browser = p.chromium.launch(headless=False, slow_mo=200)
 
         # 先尝试从 state.json 加载状态（cookie/session）
         try:
@@ -189,40 +269,59 @@ def main() -> bool:
         page = context.new_page()
         page.goto(target_url, timeout=8000)
 
-        confirm_age_if_needed(page)
+        # 登录后再检查 18 岁确认（若页面已处于登录态也会直接检测）
+        if is_logged_in(page):
+            confirm_age_if_needed(page)
+        else:
+            # 检查状态文件里的 cookie 是否失效
+            if is_cookie_expired(page):
+                print("[WARN] Cookie 已过期，使用账号密码登录")
+                login_with_user_pass(page, username, password)
+                if is_logged_in(page):
+                    print("[INFO] 登录成功，更新状态文件")
+                    context.storage_state(path=STATE_FILE)
+                    # 登录成功后再检查一次 18 岁确认
+                    confirm_age_if_needed(page)
+                else:
+                    print("[ERROR] 登录失败")
+                    browser.close()
+                    return False
 
-        # 检查状态文件里的 cookie 是否失效
-        if is_cookie_expired(page):
-            print("[WARN] Cookie 已过期，使用账号密码登录")
-            login_with_user_pass(page, username, password)
-            if is_logged_in(page):
-                print("[INFO] 登录成功，更新状态文件")
-                context.storage_state(path=STATE_FILE)
-            else:
-                print("[ERROR] 登录失败")
-                browser.close()
-                return False
+        # --- 新增/修改：页面若已出现“今天已经签到过啦”，直接判定成功并截图祖先 ---
+        if wait_signed_text_and_shoot(page, timeout=2000):
+            print("[INFO] 已经签到过啦（页面已有提示）")
+            browser.close()
+            return True
 
+        # 正常签到流程
         if is_sign_button_visible(page):
             click_sign_in_button(page)
             if is_captcha_visible(page):
                 solve_geetest_puzzle(page)
-                if wait_captcha_disappear(page):
-                    print("[INFO] 签到成功（验证码消失）")
+                # 成功判定：等待出现“今天已经签到过啦”
+                if wait_signed_text_and_shoot(page, timeout=10000):
+                    print("[INFO] 签到成功（出现『今天已经签到过啦』）")
                     browser.close()
                     return True
                 else:
-                    print("[ERROR] 签到失败，验证码未消失")
+                    print("[ERROR] 签到失败：未出现『今天已经签到过啦』提示")
                     browser.close()
                     return False
             else:
-                print("[INFO] 无需验证码，签到成功")
-                browser.close()
-                return True
+                # 无验证码路径：同样等待出现成功提示
+                if wait_signed_text_and_shoot(page, timeout=8000):
+                    print("[INFO] 签到成功（无需验证码）")
+                    browser.close()
+                    return True
+                else:
+                    print("[ERROR] 签到失败：未出现『今天已经签到过啦』提示（无需验证码路径）")
+                    browser.close()
+                    return False
         else:
-            print("[INFO] 未发现签到按钮，可能已签到")
+            # 不再以“找不到按钮”作为成功判据；此分支仅作为提示与失败返回
+            print("[ERROR] 未发现签到按钮，且未检测到『今天已经签到过啦』提示")
             browser.close()
-            return True
+            return False
 
 # ---------------- 带重试启动 ----------------
 if __name__ == "__main__":
